@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-knowledge-base"
+version = "0.1.0"
+description = "Local-first PDF/Markdown knowledge base with CLI and MCP"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+pdf = ["docling>=2.0", "pymupdf>=1.24"]
+vector = ["lancedb>=0.20", "sentence-transformers>=3.0"]
+metadata = ["httpx>=0.27"]
+mcp = ["mcp>=1.0"]
+all = ["docling>=2.0", "pymupdf>=1.24", "lancedb>=0.20", "sentence-transformers>=3.0", "httpx>=0.27", "mcp>=1.0"]
+
+[project.scripts]
+kb = "kb.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

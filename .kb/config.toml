@@ -1,0 +1,4 @@
+# Rebuildable local knowledge-base settings
+# Vector search is opt-in because it may download a model on first use.
+enable_vectors = false
+embedding_model = "BAAI/bge-small-zh-v1.5"
