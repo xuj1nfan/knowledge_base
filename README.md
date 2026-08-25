@@ -36,7 +36,7 @@ uv pip install --python .venv/bin/python lancedb sentence-transformers
 uv pip install --python .venv/bin/python docling
 ```
 
-没有 NVIDIA GPU 时，应使用 CPU 版 PyTorch，避免误装 CUDA 依赖：
+非N卡：
 
 ```bash
 uv pip install --python .venv/bin/python \
@@ -113,21 +113,9 @@ embedding_model = "BAAI/bge-small-zh-v1.5"
 ./kb index --all --force
 ```
 
-首次运行会从 Hugging Face 下载模型。CPU 环境推荐 `bge-small-zh-v1.5`；`bge-m3` 更大，下载和编码时间明显更长。若 LanceDB 在当前系统中连接异常，可以保持 `enable_vectors = false`，SQLite FTS 检索仍完整可用。
+首次运行会从 Hugging Face 下载模型。
 
-## 目录结构
 
-```text
-library/papers/       本地 PDF（默认不提交）
-library/notes/        本地 Markdown 笔记（默认不提交）
-bibliography/         BibTeX 书目（默认不提交）
-projects/             论文草稿和证据矩阵（默认不提交）
-.kb/                  SQLite、解析文本和索引（可重建，不提交）
-src/kb/               CLI、解析、搜索和 MCP 实现
-tests/                单元测试
-```
-
-个人论文和笔记不应直接推送到公共仓库；`.gitignore` 已保护这些本地数据。
 
 ## 验证
 
