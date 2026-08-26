@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from kb.core import Config, add_document, get_document, get_passage, index_all, index_document, page_image, search, status
+from kb.importer import import_documents
 from kb.mcp_server import serve
 
 
@@ -41,6 +42,11 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--year")
     add.add_argument("--doi")
     add.add_argument("--citekey")
+    imp = sub.add_parser("import", help="import PDFs with metadata lookup and indexing")
+    imp.add_argument("source", type=Path)
+    imp.add_argument("--dry-run", action="store_true", help="resolve metadata without copying or indexing")
+    imp.add_argument("--offline", action="store_true", help="use only embedded PDF metadata")
+    imp.add_argument("--no-index", action="store_true", help="copy and catalog without indexing")
     idx = sub.add_parser("index")
     idx.add_argument("citekey", nargs="?")
     idx.add_argument("--all", action="store_true")
@@ -85,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "add":
             value = add_document(config, args.source, title=args.title, author=args.author, year=args.year, doi=args.doi, citekey=args.citekey)
+        elif args.command == "import":
+            value = import_documents(config, args.source, dry_run=args.dry_run, offline=args.offline, no_index=args.no_index)
         elif args.command == "index":
             value = index_all(config, force=args.force) if args.all else index_document(config, args.citekey) if args.citekey else (_ for _ in ()).throw(ValueError("index needs a citekey or --all"))
         elif args.command == "search":
@@ -128,11 +136,13 @@ def main(argv: list[str] | None = None) -> int:
                 "status": status(config),
                 "sqlite_fts5": True,
                 "commands": {name: bool(shutil.which(name)) for name in ("pdftotext", "pdfinfo", "pdftoppm")},
-                "optional": {name: _optional_available(name) for name in ("docling", "lancedb", "sentence_transformers", "mcp")},
+                "optional": {name: _optional_available(name) for name in ("docling", "docling_core", "lancedb", "sentence_transformers", "httpx", "mcp")},
             }
         else:
             raise ValueError(f"unknown command: {args.command}")
         emit(value, args.as_json)
+        if args.command == "import" and any(item.get("status") == "failed" for item in value):
+            return 1
         return 0
     except Exception as exc:
         print(f"kb: error: {exc}", file=sys.stderr)

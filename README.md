@@ -33,7 +33,10 @@ uv pip install --python .venv/bin/python -e .
 uv pip install --python .venv/bin/python lancedb sentence-transformers
 
 # 更复杂的 PDF 版面、表格和公式解析
-uv pip install --python .venv/bin/python docling
+uv pip install --python .venv/bin/python 'docling>=2.0' 'docling-core>=2.24.0'
+
+# PDF 元数据、DOI/arXiv 自动导入
+uv pip install --python .venv/bin/python 'httpx>=0.27' 'pymupdf>=1.24'
 ```
 
 非N卡：
@@ -52,6 +55,9 @@ uv pip install --python .venv/bin/python \
 ./kb add ~/notes/method.md --title "Method notes"
 ./kb index --all
 ./kb search "retrieval augmented generation" --limit 5
+
+# 自动识别 PDF 元数据、生成 citekey、写 BibTeX 并建立索引
+./kb --json import ~/Books/incoming
 ```
 
 常用命令：
@@ -66,6 +72,8 @@ uv pip install --python .venv/bin/python \
 ```
 
 论文引用格式为：`[@citekey, p. 2]`。
+
+PDF 页码采用物理页码（从 1 开始）；Docling 导出会保留页分隔符，无法可靠保留时自动回退到 `pdftotext`。
 
 ## 导入现有目录
 
@@ -100,7 +108,7 @@ args = ["--root", "/absolute/path/to/knowledge-base", "serve-mcp"]
 
 ## 向量检索
 
-向量索引是可选功能，在 `.kb/config.toml` 中启用：
+向量索引是可选功能，在 `.kb/config.toml` 中启用。启用后，搜索会用 SQLite lexical BM25 与向量候选做 RRF（Reciprocal Rank Fusion）融合；`score` 越高越相关：
 
 ```toml
 enable_vectors = true
@@ -115,7 +123,18 @@ embedding_model = "BAAI/bge-small-zh-v1.5"
 
 首次运行会从 Hugging Face 下载模型。
 
+## 自动导入论文
 
+`kb import` 接受单个 PDF 或目录（递归扫描），默认先读取 PDF metadata 和首页文本，再按 DOI、arXiv ID 查询 Crossref/arXiv，生成 citekey、写入 BibTeX 并索引：
+
+```text
+PDF metadata → DOI/arXiv detection → Crossref/arXiv metadata
+             → title/authors/year/DOI → citekey → BibTeX → index
+```
+
+只接受明确标识符，不做标题模糊匹配；没有标识符时使用本地字段并标记 `metadata_status=partial`。网络失败或标识符冲突的文件不会写入，可安全重试。使用 `--dry-run` 预览，使用 `--offline` 禁止联网，使用 `--no-index` 只复制和登记。
+
+若配置 Crossref polite pool，可在 `.kb/config.toml` 设置 `crossref_mailto = "you@example.org"`。自动导入是 CLI 操作，`kb add` 仍保持手工、离线语义。
 
 ## 验证
 
@@ -123,3 +142,5 @@ embedding_model = "BAAI/bge-small-zh-v1.5"
 ./kb doctor
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+更完整的 CLI、Codex 提示词和论文写作流程见 [`docs/knowledge-base-usage.md`](docs/knowledge-base-usage.md)。

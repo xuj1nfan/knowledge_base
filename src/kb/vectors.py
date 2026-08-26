@@ -72,7 +72,7 @@ def sync_document(config: Any, citekey: str, chunks: list[dict[str, Any]]) -> bo
     return True
 
 
-def query(config: Any, text: str, limit: int) -> list[dict[str, Any]]:
+def query(config: Any, text: str, limit: int, *, citekey: str | None = None) -> list[dict[str, Any]]:
     if not enabled(config):
         return []
     import lancedb  # type: ignore
@@ -83,7 +83,13 @@ def query(config: Any, text: str, limit: int) -> list[dict[str, Any]]:
         return []
     model = _get_model(model_name(config), SentenceTransformer)
     vector = model.encode([text], normalize_embeddings=True)[0].tolist()
-    rows = db.open_table("chunks").search(vector).limit(limit).to_list()
+    search = db.open_table("chunks").search(vector)
+    if citekey:
+        # LanceDB applies the predicate before limiting, ensuring a document
+        # filter does not accidentally discard all relevant semantic hits.
+        safe_key = citekey.replace("'", "''")
+        search = search.where(f"citekey = '{safe_key}'")
+    rows = search.limit(limit).to_list()
     return [
         {
             "id": row.get("chunk_id"),

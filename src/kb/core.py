@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 import shutil
@@ -14,6 +15,7 @@ from typing import Any, Iterable
 
 
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
+PDF_PAGE_BREAK = "\f"
 
 
 def now_iso() -> str:
@@ -66,8 +68,13 @@ def parse_bibtex(text: str) -> dict[str, dict[str, str]]:
 def append_bibtex(path: Path, citekey: str, entry_type: str, fields: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if citekey in parse_bibtex(existing):
+        return
     lines = [f"@{entry_type}{{{citekey},"]
-    ordered = ["author", "title", "year", "journal", "booktitle", "doi", "url"]
+    ordered = [
+        "author", "title", "year", "journal", "booktitle", "doi", "url",
+        "eprint", "archivePrefix", "primaryClass",
+    ]
     for key in ordered:
         if fields.get(key):
             lines.append(f"  {key} = {{{bib_escape(fields[key])}}},")
@@ -122,6 +129,8 @@ class Config:
                 "# Vector search is opt-in because it may download a model on first use.\n"
                 "enable_vectors = false\n"
                 "embedding_model = \"BAAI/bge-m3\"\n"
+                "# Optional Crossref polite-pool contact address.\n"
+                "crossref_mailto = \"\"\n"
                 "\n",
                 encoding="utf-8",
             )
@@ -144,6 +153,11 @@ def open_db(config: Config) -> sqlite3.Connection:
             author TEXT,
             year TEXT,
             doi TEXT,
+            arxiv_id TEXT,
+            journal TEXT,
+            url TEXT,
+            metadata_source TEXT NOT NULL DEFAULT 'manual',
+            metadata_status TEXT NOT NULL DEFAULT 'partial',
             status TEXT NOT NULL DEFAULT 'new',
             pages INTEGER,
             added_at TEXT NOT NULL,
@@ -175,6 +189,36 @@ def open_db(config: Config) -> sqlite3.Connection:
         END;
         """
     )
+    # The catalog is intentionally rebuildable, but existing local catalogs
+    # should upgrade in place when new metadata fields are introduced.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(documents)")}
+    migrations = {
+        "arxiv_id": "TEXT",
+        "journal": "TEXT",
+        "url": "TEXT",
+        "metadata_source": "TEXT NOT NULL DEFAULT 'manual'",
+        "metadata_status": "TEXT NOT NULL DEFAULT 'partial'",
+    }
+    for name, declaration in migrations.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
+    for field, unique_name, lookup_name in (
+        ("doi", "documents_doi_unique", "documents_doi_lookup"),
+        ("arxiv_id", "documents_arxiv_unique", "documents_arxiv_lookup"),
+    ):
+        try:
+            db.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {unique_name} "
+                f"ON documents({field}) WHERE {field} IS NOT NULL AND {field} <> ''"
+            )
+        except sqlite3.IntegrityError:
+            # Preserve access to an older catalog that already contains
+            # duplicate identifiers; new imports still check identity before
+            # inserting, while the regular index keeps lookups efficient.
+            db.execute(
+                f"CREATE INDEX IF NOT EXISTS {lookup_name} "
+                f"ON documents({field}) WHERE {field} IS NOT NULL AND {field} <> ''"
+            )
     db.commit()
     return db
 
@@ -193,19 +237,41 @@ def _pdf_pages(path: Path) -> int | None:
 def extract_pdf(path: Path, output_dir: Path) -> tuple[str, int | None, str]:
     """Return text, page count and extraction method."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    page_count = _pdf_pages(path)
     try:
         import docling  # type: ignore  # noqa: F401
         from docling.document_converter import DocumentConverter  # type: ignore
 
         result = DocumentConverter().convert(str(path))
-        text = result.document.export_to_markdown()
+        exporter = result.document.export_to_markdown
+        # page_break_placeholder was added to docling-core after the initial
+        # docling 2.x releases. Check the signature before calling it so an
+        # old optional install cleanly falls back to pdftotext.
+        try:
+            parameters = inspect.signature(exporter).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if parameters and "page_break_placeholder" not in parameters and not accepts_kwargs:
+            raise RuntimeError("Docling export_to_markdown lacks page_break_placeholder")
+        text = exporter(page_break_placeholder=PDF_PAGE_BREAK)
+        docling_pages = getattr(result.document, "pages", None)
+        expected_pages = page_count or (len(docling_pages) if docling_pages else None)
+        if text and expected_pages and text.count(PDF_PAGE_BREAK) + 1 != expected_pages:
+            raise RuntimeError(
+                "Docling page count mismatch: "
+                f"markers={text.count(PDF_PAGE_BREAK) + 1}, expected={expected_pages}"
+            )
         method = "docling"
     except Exception:
         if not shutil.which("pdftotext"):
             raise RuntimeError("PDF extraction requires Docling or the pdftotext command")
         text = subprocess.check_output(["pdftotext", "-layout", str(path), "-"], text=True, stderr=subprocess.STDOUT)
         method = "pdftotext"
-    return text, _pdf_pages(path), method
+    return text, page_count, method
 
 
 def extract_text(path: Path) -> str:
@@ -253,7 +319,21 @@ def split_chunks(text: str, kind: str = "text", max_chars: int = 2200) -> list[d
     return chunks
 
 
-def add_document(config: Config, source: Path, *, title: str | None = None, author: str | None = None, year: str | None = None, doi: str | None = None, citekey: str | None = None) -> dict[str, Any]:
+def add_document(
+    config: Config,
+    source: Path,
+    *,
+    title: str | None = None,
+    author: str | None = None,
+    year: str | None = None,
+    doi: str | None = None,
+    arxiv_id: str | None = None,
+    journal: str | None = None,
+    url: str | None = None,
+    metadata_source: str = "manual",
+    metadata_status: str = "partial",
+    citekey: str | None = None,
+) -> dict[str, Any]:
     config.ensure()
     source = source.expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in {".pdf", *TEXT_SUFFIXES}:
@@ -262,7 +342,16 @@ def add_document(config: Config, source: Path, *, title: str | None = None, auth
     db = open_db(config)
     duplicate = db.execute("SELECT citekey, path FROM documents WHERE sha256=?", (digest,)).fetchone()
     if duplicate:
+        db.close()
         return {"status": "duplicate", "citekey": duplicate["citekey"], "path": duplicate["path"]}
+    if doi or arxiv_id:
+        identity = db.execute(
+            "SELECT citekey, path FROM documents WHERE (? <> '' AND doi=?) OR (? <> '' AND arxiv_id=?) LIMIT 1",
+            (doi or "", doi or "", arxiv_id or "", arxiv_id or ""),
+        ).fetchone()
+        if identity:
+            db.close()
+            return {"status": "duplicate", "citekey": identity["citekey"], "path": identity["path"]}
     title = title or source.stem
     author = author or "Unknown"
     keys = [row[0] for row in db.execute("SELECT citekey FROM documents")]
@@ -275,11 +364,24 @@ def add_document(config: Config, source: Path, *, title: str | None = None, auth
         shutil.copy2(source, destination)
     kind = "pdf" if suffix == ".pdf" else "markdown"
     db.execute(
-        "INSERT INTO documents(citekey,path,kind,sha256,title,author,year,doi,status,added_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (citekey, str(destination), kind, digest, title, author, year, doi, "new", now_iso()),
+        "INSERT INTO documents(citekey,path,kind,sha256,title,author,year,doi,arxiv_id,journal,url,metadata_source,metadata_status,status,added_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            citekey, str(destination), kind, digest, title, author, year, doi,
+            arxiv_id, journal, url, metadata_source, metadata_status, "new", now_iso(),
+        ),
     )
     db.commit()
-    append_bibtex(config.bib, citekey, "article" if kind == "pdf" else "misc", {"title": title, "author": author, "year": year or "", "doi": doi or ""})
+    bib_fields = {
+        "title": title,
+        "author": author,
+        "year": year or "",
+        "doi": doi or "",
+        "journal": journal or "",
+        "url": url or "",
+    }
+    if arxiv_id:
+        bib_fields.update({"eprint": arxiv_id, "archivePrefix": "arXiv"})
+    append_bibtex(config.bib, citekey, "article" if kind == "pdf" else "misc", bib_fields)
     db.close()
     return {"status": "added", "citekey": citekey, "path": str(destination)}
 
@@ -346,8 +448,7 @@ def index_all(config: Config, force: bool = False) -> list[dict[str, Any]]:
     return results
 
 
-def search(config: Config, query: str, limit: int = 10, citekey: str | None = None) -> list[dict[str, Any]]:
-    db = open_db(config)
+def _lexical_search(db: sqlite3.Connection, query: str, limit: int, citekey: str | None = None) -> list[dict[str, Any]]:
     terms = re.sub(r"[^\w\-]+", " ", query, flags=re.UNICODE).strip()
     if not terms:
         return []
@@ -391,16 +492,71 @@ def search(config: Config, query: str, limit: int = 10, citekey: str | None = No
         ).fetchall()
         if fallback:
             rows = fallback
+
+    return [dict(row) for row in rows]
+
+
+def search(config: Config, query: str, limit: int = 10, citekey: str | None = None) -> list[dict[str, Any]]:
+    """Search with reciprocal-rank fusion of lexical and semantic candidates."""
+    if limit <= 0:
+        return []
+    db = open_db(config)
+    candidate_limit = max(limit * 4, 50)
+    lexical_rows = _lexical_search(db, query, candidate_limit, citekey)
     try:
         from .vectors import query as vector_query
-        semantic_rows = vector_query(config, query, limit)
-        known = {row["id"] for row in rows}
-        rows = list(rows) + [row for row in semantic_rows if row["id"] not in known]
-        rows = rows[:limit]
-    except (ImportError, OSError, RuntimeError):
-        pass
+        semantic_rows = vector_query(config, query, candidate_limit, citekey=citekey)
+    except Exception:
+        # Optional vector dependencies and local model/index failures must not
+        # make the always-available SQLite search unusable.
+        semantic_rows = []
+
+    # RRF is rank-based, so BM25 scores and LanceDB distances do not need to
+    # be calibrated onto a common numeric scale. Ranks are one-based.
+    rrf_k = 60
+    merged: dict[int, dict[str, Any]] = {}
+    for rank, row in enumerate(lexical_rows, 1):
+        item = dict(row)
+        chunk_id = int(item["id"])
+        lexical_score = item.get("score")
+        item["score"] = 1.0 / (rrf_k + rank)
+        item["lexical_rank"] = rank
+        item["semantic_rank"] = None
+        item["retrieval_sources"] = ["lexical"]
+        item["semantic"] = False
+        item["lexical_score"] = lexical_score
+        merged[chunk_id] = item
+    for rank, row in enumerate(semantic_rows, 1):
+        item = dict(row)
+        chunk_id = int(item["id"])
+        contribution = 1.0 / (rrf_k + rank)
+        if chunk_id in merged:
+            merged_item = merged[chunk_id]
+            merged_item["score"] += contribution
+            merged_item["semantic_rank"] = rank
+            merged_item["retrieval_sources"] = ["lexical", "semantic"]
+            merged_item["semantic"] = True
+            merged_item["semantic_distance"] = item.get("score")
+        else:
+            semantic_distance = item.get("score")
+            item["score"] = contribution
+            item["lexical_rank"] = None
+            item["semantic_rank"] = rank
+            item["retrieval_sources"] = ["semantic"]
+            item["semantic"] = True
+            item["semantic_distance"] = semantic_distance
+            merged[chunk_id] = item
+
+    rows = sorted(
+        merged.values(),
+        key=lambda item: (
+            -float(item["score"]),
+            min(rank for rank in (item.get("lexical_rank"), item.get("semantic_rank")) if rank is not None),
+            int(item["id"]),
+        ),
+    )[:limit]
     db.close()
-    return [dict(row) for row in rows]
+    return rows
 
 
 def get_document(config: Config, citekey: str) -> dict[str, Any] | None:
